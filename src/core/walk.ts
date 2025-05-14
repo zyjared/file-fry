@@ -36,30 +36,42 @@ interface WalkOptions {
   ignore?: RegExp | ((filepath: string) => boolean)
 }
 
-interface FileContext<T = void> {
+interface FileContext {
   filepath: string
   read: () => Promise<string>
-  write: (content: string, savepath?: string) => Promise<T>
+  write: (content: string, savepath?: string) => Promise<void>
 }
 
-type FileProcessor<T = void> = (context: FileContext) => Promise<T> | T
-
-interface ProgressEventOptions extends WalkOptions {
-  processed: number
-  total: number
+interface WalkProgress {
   success: number
   failed: number
+  total: number
 }
 
-interface WalkEvents {
-  before: (options: WalkOptions) => void
-  after: (options: WalkOptions) => void
-  progress: (options: ProgressEventOptions) => void
+interface WalkContext<T extends Record<string, any> = Record<string, any>>
+  extends FileContext {
+  ins: Walk<T>
 }
 
-export class Walk {
-  private options: Required<WalkOptions>
-  private hooks = new Map<keyof WalkEvents, Array<(...args: any[]) => void>>()
+type FileProcessor<T = void> = (ctx: WalkContext) => Promise<T> | T
+
+type WalkHook = (ins: WalkContext['ins']) => void
+type WalkHooks = Map<string, WalkHook[]>
+
+export class Walk<T extends Record<string, any> = Record<string, any>> {
+  protected options: Required<WalkOptions>
+  protected hooks: WalkHooks = new Map()
+
+  /**
+   * 自定义扩展
+   */
+  data: T = {} as T
+
+  progress: WalkProgress = {
+    success: 0,
+    failed: 0,
+    total: 0,
+  }
 
   constructor(options: WalkOptions = {}) {
     this.options = {
@@ -90,22 +102,31 @@ export class Walk {
     return false
   }
 
-  on<K extends keyof WalkEvents>(event: K, callback: WalkEvents[K]): void {
-    let hooks = this.hooks.get(event)
-    if (!hooks)
-      this.hooks.set(event, hooks = [])
+  onHook(name: 'start' | 'end', callback: WalkHook): Walk {
+    let hooks = this.hooks.get(name)
+    if (!hooks) {
+      this.hooks.set(name, hooks = [])
+    }
     hooks.push(callback)
+    return this
   }
 
-  private async triggerHooks<K extends keyof WalkEvents>(
-    event: K,
-    options: K extends 'progress' ? ProgressEventOptions : WalkOptions,
+  onStart(callback: WalkHook): Walk {
+    return this.onHook('start', callback)
+  }
+
+  onEnd(callback: WalkHook): Walk {
+    return this.onHook('end', callback)
+  }
+
+  private async triggerHooks(
+    event: string,
   ): Promise<void> {
-    const hooks = this.hooks.get(event) || []
-    await Promise.all(hooks.map(hook => hook(options)))
+    const hooks = this.hooks.get(event)
+    hooks && await Promise.all(hooks.map(hook => hook(this)))
   }
 
-  private createFileContext(filepath: string): FileContext {
+  private createContext(filepath: string): WalkContext {
     const ctx = {
       filepath,
       read: async () => {
@@ -115,6 +136,7 @@ export class Walk {
       write: async (content: string, savepath?: string) => {
         await fs.writeFile(savepath || filepath, content)
       },
+      ins: this,
     }
 
     return ctx
@@ -124,60 +146,61 @@ export class Walk {
     const files = await this.getFiles()
 
     // 进度统计
-    const totalFiles = files.length
-    let scussessCount = 0
-    let failedCount = 0
+    this.progress.total = files.length
+
+    // start
+    await this.triggerHooks('start')
 
     const queue = new PQueue({ concurrency: this.options.concurrency })
-
     const results = await queue.addAll(files.map(file => async () => {
       try {
-        if (this.shouldIgnore(file))
+        if (this.shouldIgnore(file)) {
           return
+        }
 
-        const ctx = this.createFileContext(file)
+        const ctx = this.createContext(file)
         const result = await processor(ctx)
-        scussessCount++
+        this.progress.success++
         return result
       }
-      catch (error) {
-        // console.error(`Error processing file ${file}:`, error)
-        failedCount++
-        throw error
+      catch {
+        this.progress.failed++
       }
     }))
 
-    await this.triggerHooks('progress', {
-      ...this.options,
-      processed: scussessCount,
-
-      total: totalFiles,
-      success: scussessCount,
-      failed: failedCount,
-    })
+    // end
+    await this.triggerHooks('end')
 
     return results.filter(Boolean) as T[]
   }
 }
 
-type WalkOptionsWithProgress = WalkOptions & {
-  progress?: (options: ProgressEventOptions) => void
-}
-
-interface WalkOptionsWithExec<T = void> extends WalkOptionsWithProgress {
+interface WalkOptionsWithExec<T = void> extends WalkOptions {
   exec?: FileProcessor<T>
+  onStart?: WalkHook
+  onEnd?: WalkHook
 }
 
-export async function walk<T = void>(options: WalkOptionsWithExec<T>): Promise<T[]>
-export async function walk<T = void>(options: WalkOptionsWithProgress, exec: FileProcessor<T>): Promise<T[]>
-export async function walk<T = void>(options: WalkOptionsWithProgress & { exec?: FileProcessor<T> } = {}, exec?: FileProcessor<T>): Promise<T[]> {
+export async function walk<T>(
+  options: WalkOptionsWithExec<T>,
+): Promise<T[]>
+export async function walk<T>(
+  options: WalkOptionsWithExec<T>,
+  exec: FileProcessor<T>,
+): Promise<T[]>
+export async function walk<T>(
+  options: WalkOptionsWithExec & { exec?: FileProcessor<T> } = {},
+  exec?: FileProcessor<T>,
+): Promise<T[]> {
   const callback = exec || options.exec
-  if (!callback)
+  if (!callback) {
     throw new Error('Missing callback')
+  }
 
   const walker = new Walk(options)
 
-  options.progress && walker.on('progress', options.progress)
+  options.onStart && walker.onStart(options.onStart)
+  options.onEnd && walker.onEnd(options.onEnd)
 
   return await walker.run(callback)
 }
